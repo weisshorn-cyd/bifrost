@@ -16,10 +16,14 @@ import (
 	"bifrost/internal/session"
 )
 
+const DefaultPollInterval = time.Second
+
 type Server struct {
-	Addr   string
-	Client *session.Client
-	Logger *log.Logger
+	Addr           string
+	Client         *session.Client
+	Logger         *log.Logger
+	PollInterval   time.Duration
+	DisablePolling bool
 
 	ln net.Listener
 }
@@ -73,11 +77,24 @@ func (s *Server) handleConn(parent context.Context, conn net.Conn) {
 
 func (s *Server) proxy(ctx context.Context, cancel context.CancelFunc, conn net.Conn, streamID protocol.StreamID) {
 	respCh := make(chan protocol.Frame, 64)
+	pollNow := make(chan struct{}, 1)
 	var wg sync.WaitGroup
+	var sendMu sync.Mutex
+	send := func(ctx context.Context, f protocol.Frame) (protocol.Frame, error) {
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		return s.Client.Send(ctx, f)
+	}
 	sendResp := func(f protocol.Frame) {
 		select {
 		case respCh <- f:
 		case <-ctx.Done():
+		}
+	}
+	requestPoll := func() {
+		select {
+		case pollNow <- struct{}{}:
+		default:
 		}
 	}
 	wg.Add(1)
@@ -88,7 +105,7 @@ func (s *Server) proxy(ctx context.Context, cancel context.CancelFunc, conn net.
 			n, err := conn.Read(buf)
 			if n > 0 {
 				payload := append([]byte(nil), buf[:n]...)
-				resp, qerr := s.Client.Send(ctx, protocol.Frame{Version: protocol.Version, Type: protocol.TypeData, StreamID: streamID, Payload: payload})
+				resp, qerr := send(ctx, protocol.Frame{Version: protocol.Version, Type: protocol.TypeData, StreamID: streamID, Payload: payload})
 				if qerr == nil {
 					sendResp(resp)
 				}
@@ -98,7 +115,7 @@ func (s *Server) proxy(ctx context.Context, cancel context.CancelFunc, conn net.
 				}
 			}
 			if err != nil {
-				_, _ = s.Client.Send(context.Background(), protocol.Frame{Version: protocol.Version, Type: protocol.TypeClose, StreamID: streamID})
+				_, _ = send(context.Background(), protocol.Frame{Version: protocol.Version, Type: protocol.TypeClose, StreamID: streamID})
 				cancel()
 				return
 			}
@@ -107,19 +124,34 @@ func (s *Server) proxy(ctx context.Context, cancel context.CancelFunc, conn net.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		t := time.NewTicker(20 * time.Millisecond)
-		defer t.Stop()
+		var tick <-chan time.Time
+		var ticker *time.Ticker
+		if !s.DisablePolling {
+			ticker = time.NewTicker(s.pollInterval())
+			defer ticker.Stop()
+			tick = ticker.C
+		}
+		poll := func() bool {
+			resp, err := send(ctx, protocol.Frame{Version: protocol.Version, Type: protocol.TypePing, StreamID: streamID})
+			if err != nil {
+				cancel()
+				return false
+			}
+			sendResp(resp)
+			return true
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-t.C:
-				resp, err := s.Client.Send(ctx, protocol.Frame{Version: protocol.Version, Type: protocol.TypePing, StreamID: streamID})
-				if err != nil {
-					cancel()
+			case <-pollNow:
+				if !poll() {
 					return
 				}
-				sendResp(resp)
+			case <-tick:
+				if !poll() {
+					return
+				}
 			}
 		}
 	}()
@@ -135,6 +167,8 @@ func (s *Server) proxy(ctx context.Context, cancel context.CancelFunc, conn net.
 				if len(f.Payload) > 0 {
 					if _, err := conn.Write(f.Payload); err != nil {
 						cancel()
+					} else {
+						requestPoll()
 					}
 				}
 			case protocol.TypeClose, protocol.TypeError:
@@ -142,6 +176,13 @@ func (s *Server) proxy(ctx context.Context, cancel context.CancelFunc, conn net.
 			}
 		}
 	}
+}
+
+func (s *Server) pollInterval() time.Duration {
+	if s.PollInterval > 0 {
+		return s.PollInterval
+	}
+	return DefaultPollInterval
 }
 
 func handshake(rw net.Conn) (string, error) {

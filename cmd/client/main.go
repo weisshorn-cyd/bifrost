@@ -24,6 +24,7 @@ func main() {
 		listen  = flag.String("listen", env("BIFROST_SOCKS_ADDR", "127.0.0.1:1080"), "SOCKS5 listen address")
 		dohURL  = flag.String("doh-url", env("BIFROST_DOH_URL", ""), "DoH endpoint URL; selects DoH when set")
 		dnsAddr = flag.String("dns-addr", env("BIFROST_DNS_ADDR", ""), "UDP DNS server address; selects DNS-over-UDP when set")
+		poll    = flag.Duration("poll-interval", envDuration("BIFROST_POLL_INTERVAL", socks.DefaultPollInterval), "server response polling interval; set 0 to disable periodic idle polling")
 	)
 	flag.Parse()
 
@@ -37,7 +38,7 @@ func main() {
 		log.Fatal(err)
 	}
 	logger := log.New(os.Stdout, "bifrost-client ", log.LstdFlags|log.Lmicroseconds)
-	srv := &socks.Server{Addr: *listen, Client: client, Logger: logger}
+	srv := &socks.Server{Addr: *listen, Client: client, Logger: logger, PollInterval: *poll, DisablePolling: *poll == 0}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	logger.Printf("socks5 listening on %s via %s", *listen, transport)
@@ -62,6 +63,16 @@ func newRoundTripper(dnsAddr, dohURL, domain string, reg *metrics.Registry) (ses
 func env(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func envDuration(name string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(name); v != "" {
+		d, err := time.ParseDuration(v)
+		if err == nil {
+			return d
+		}
 	}
 	return fallback
 }

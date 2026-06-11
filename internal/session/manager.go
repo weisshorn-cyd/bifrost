@@ -17,21 +17,29 @@ import (
 )
 
 const (
+	DefaultResponsePayloadSize = protocol.MaxResponsePayload
+	MaxResponsePayloadSize     = protocol.MaxFramePayload
+	DefaultResponseWaitTimeout = 250 * time.Millisecond
+
 	responseCacheTTL = 10 * time.Minute
 	sessionTTL       = 30 * time.Minute
 	dialTimeout      = 5 * time.Second
 )
 
 type Manager struct {
-	secret        string
-	policy        *policy.Policy
-	metrics       *metrics.Registry
-	logger        *log.Logger
-	TraceRequests bool
+	secret              string
+	policy              *policy.Policy
+	metrics             *metrics.Registry
+	logger              *log.Logger
+	TraceSummary        bool
+	TraceRequests       bool
+	ResponsePayloadSize int
+	ResponseWaitTimeout time.Duration
 
 	mu       sync.Mutex
 	sessions map[protocol.SessionID]*Session
 	cache    map[cacheKey]*cacheEntry
+	inflight map[cacheKey]*inflightQuery
 	order    *list.List
 }
 
@@ -50,12 +58,14 @@ type Stream struct {
 	done    chan struct{}
 	once    sync.Once
 
-	trace         bool
-	logger        *log.Logger
-	openedAt      time.Time
-	requestBytes  atomic.Int64
-	responseBytes atomic.Int64
-	summaryOnce   sync.Once
+	trace               bool
+	logger              *log.Logger
+	openedAt            time.Time
+	responsePayloadSize int
+	responseWaitTimeout time.Duration
+	requestBytes        atomic.Int64
+	responseBytes       atomic.Int64
+	summaryOnce         sync.Once
 }
 
 type cacheKey struct {
@@ -70,6 +80,12 @@ type cacheEntry struct {
 	elem    *list.Element
 }
 
+type inflightQuery struct {
+	done    chan struct{}
+	payload []byte
+	err     error
+}
+
 func NewManager(secret string, p *policy.Policy, m *metrics.Registry, logger *log.Logger) *Manager {
 	return &Manager{
 		secret:   secret,
@@ -78,6 +94,7 @@ func NewManager(secret string, p *policy.Policy, m *metrics.Registry, logger *lo
 		logger:   logger,
 		sessions: make(map[protocol.SessionID]*Session),
 		cache:    make(map[cacheKey]*cacheEntry),
+		inflight: make(map[cacheKey]*inflightQuery),
 		order:    list.New(),
 	}
 }
@@ -97,6 +114,16 @@ func (m *Manager) HandlePacket(in []byte) ([]byte, error) {
 		m.mu.Unlock()
 		return out, nil
 	}
+	if inFlight := m.inflight[key]; inFlight != nil {
+		m.mu.Unlock()
+		<-inFlight.done
+		if inFlight.err != nil {
+			return nil, inFlight.err
+		}
+		return append([]byte(nil), inFlight.payload...), nil
+	}
+	inFlight := &inflightQuery{done: make(chan struct{})}
+	m.inflight[key] = inFlight
 	s := m.sessions[pkt.SessionID]
 	if s == nil {
 		s = &Session{id: pkt.SessionID, streams: make(map[protocol.StreamID]*Stream), lastSeen: time.Now()}
@@ -112,10 +139,24 @@ func (m *Manager) HandlePacket(in []byte) ([]byte, error) {
 	resp := m.handleFrame(s, frame)
 	out, err := protocol.EncodeSecureFrame(m.secret, pkt.SessionID, bifrostcrypto.ServerToClient, pkt.QuerySeq, resp)
 	if err != nil {
+		m.finishInflight(key, nil, err)
 		return nil, err
 	}
 	m.storeCache(key, out)
+	m.finishInflight(key, out, nil)
 	return out, nil
+}
+
+func (m *Manager) finishInflight(key cacheKey, payload []byte, err error) {
+	m.mu.Lock()
+	inFlight := m.inflight[key]
+	if inFlight != nil {
+		inFlight.payload = append([]byte(nil), payload...)
+		inFlight.err = err
+		delete(m.inflight, key)
+		close(inFlight.done)
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) handleFrame(s *Session, f protocol.Frame) protocol.Frame {
@@ -134,7 +175,7 @@ func (m *Manager) handleFrame(s *Session, f protocol.Frame) protocol.Frame {
 		if err != nil {
 			return errFrame(f, err.Error())
 		}
-		st := newStream(s.id, f.StreamID, dest, conn, m.TraceRequests, m.logger)
+		st := newStream(s.id, f.StreamID, dest, conn, m.responsePayloadSize(), m.responseWaitTimeout(), m.traceSummary(), m.logger)
 		m.mu.Lock()
 		old := s.streams[f.StreamID]
 		if old != nil {
@@ -186,17 +227,19 @@ func (m *Manager) handleFrame(s *Session, f protocol.Frame) protocol.Frame {
 	}
 }
 
-func newStream(sessionID protocol.SessionID, id protocol.StreamID, dest string, conn net.Conn, trace bool, logger *log.Logger) *Stream {
+func newStream(sessionID protocol.SessionID, id protocol.StreamID, dest string, conn net.Conn, responsePayloadSize int, responseWaitTimeout time.Duration, trace bool, logger *log.Logger) *Stream {
 	return &Stream{
-		id:       id,
-		session:  sessionID,
-		dest:     dest,
-		conn:     conn,
-		pending:  make(chan []byte, 128),
-		done:     make(chan struct{}),
-		trace:    trace,
-		logger:   logger,
-		openedAt: time.Now(),
+		id:                  id,
+		session:             sessionID,
+		dest:                dest,
+		conn:                conn,
+		pending:             make(chan []byte, 128),
+		done:                make(chan struct{}),
+		trace:               trace,
+		logger:              logger,
+		openedAt:            time.Now(),
+		responsePayloadSize: responsePayloadSize,
+		responseWaitTimeout: responseWaitTimeout,
 	}
 }
 
@@ -204,7 +247,7 @@ func (s *Stream) readLoop(m *metrics.Registry) {
 	defer close(s.done)
 	defer s.conn.Close()
 	defer s.logSummary("closed")
-	buf := make([]byte, protocol.MaxResponsePayload)
+	buf := make([]byte, s.responsePayloadSize)
 	for {
 		n, err := s.conn.Read(buf)
 		if n > 0 {
@@ -230,25 +273,76 @@ func (s *Stream) readLoop(m *metrics.Registry) {
 	}
 }
 
+func (m *Manager) responsePayloadSize() int {
+	if m.ResponsePayloadSize > 0 {
+		return m.ResponsePayloadSize
+	}
+	return DefaultResponsePayloadSize
+}
+
+func (m *Manager) responseWaitTimeout() time.Duration {
+	if m.ResponseWaitTimeout < 0 {
+		return 0
+	}
+	if m.ResponseWaitTimeout > 0 {
+		return m.ResponseWaitTimeout
+	}
+	return DefaultResponseWaitTimeout
+}
+
+func (m *Manager) traceSummary() bool {
+	return m.TraceSummary || m.TraceRequests
+}
+
 func (s *Stream) response(req protocol.Frame) protocol.Frame {
+	if resp, ok := s.tryResponse(req); ok {
+		return resp
+	}
+	wait := s.responseWaitTimeout
+	if wait <= 0 {
+		return protocol.Frame{Version: protocol.Version, Type: protocol.TypePong, StreamID: req.StreamID, Seq: req.Seq}
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return protocol.Frame{Version: protocol.Version, Type: protocol.TypePong, StreamID: req.StreamID, Seq: req.Seq}
+	case data := <-s.pending:
+		return dataFrame(req, data)
+	case <-s.done:
+		if resp, ok := s.tryResponse(req); ok {
+			return resp
+		}
+		return closeFrame(req)
+	}
+}
+
+func (s *Stream) tryResponse(req protocol.Frame) (protocol.Frame, bool) {
 	select {
 	case data := <-s.pending:
 		if len(data) == 0 {
-			return closeFrame(req)
+			return closeFrame(req), true
 		}
-		return protocol.Frame{Version: protocol.Version, Type: protocol.TypeData, StreamID: req.StreamID, Seq: req.Seq, Payload: data}
+		return dataFrame(req, data), true
 	case <-s.done:
 		select {
 		case data := <-s.pending:
 			if len(data) > 0 {
-				return protocol.Frame{Version: protocol.Version, Type: protocol.TypeData, StreamID: req.StreamID, Seq: req.Seq, Payload: data}
+				return dataFrame(req, data), true
 			}
 		default:
 		}
-		return closeFrame(req)
+		return closeFrame(req), true
 	default:
-		return protocol.Frame{Version: protocol.Version, Type: protocol.TypePong, StreamID: req.StreamID, Seq: req.Seq}
+		return protocol.Frame{}, false
 	}
+}
+
+func dataFrame(req protocol.Frame, data []byte) protocol.Frame {
+	if len(data) == 0 {
+		return closeFrame(req)
+	}
+	return protocol.Frame{Version: protocol.Version, Type: protocol.TypeData, StreamID: req.StreamID, Seq: req.Seq, Payload: data}
 }
 
 func (s *Stream) Close() {

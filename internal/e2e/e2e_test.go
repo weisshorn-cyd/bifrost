@@ -80,6 +80,61 @@ func TestSOCKSOverDNSUDP(t *testing.T) {
 	}
 }
 
+func TestSOCKSOverDNSUDPLargeResponse(t *testing.T) {
+	body := strings.Repeat("x", 4096)
+	upstream := newHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	}))
+	defer upstream.Close()
+
+	u, _ := url.Parse(upstream.URL)
+	dnsSrv := newDNSServer(t, u.Host)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dnsAddr := freeUDPAddr(t)
+	dnsSrv.Addr = dnsAddr
+	go func() {
+		if err := dnsSrv.ListenAndServe(ctx); err != nil {
+			t.Errorf("dns server: %v", err)
+		}
+	}()
+	waitUDP(t, dnsAddr)
+	socksAddr := startSocks(t, &dnstunnel.Client{Addr: dnsAddr, Domain: "t.example.com", Timeout: time.Second})
+
+	got := fetchViaSocks(t, socksAddr, upstream.URL+"/large")
+	if got != body {
+		t.Fatalf("body length = %d, want %d", len(got), len(body))
+	}
+}
+
+func TestSOCKSOverDNSUDPWithPollingDisabled(t *testing.T) {
+	want := "no-poll:" + strings.Repeat("z", 2048)
+	upstream := newHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(20 * time.Millisecond)
+		fmt.Fprint(w, want)
+	}))
+	defer upstream.Close()
+
+	u, _ := url.Parse(upstream.URL)
+	dnsSrv := newDNSServer(t, u.Host)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dnsAddr := freeUDPAddr(t)
+	dnsSrv.Addr = dnsAddr
+	go func() {
+		if err := dnsSrv.ListenAndServe(ctx); err != nil {
+			t.Errorf("dns server: %v", err)
+		}
+	}()
+	waitUDP(t, dnsAddr)
+	socksAddr := startSocksWithOptions(t, &dnstunnel.Client{Addr: dnsAddr, Domain: "t.example.com", Timeout: time.Second}, socksOptions{disablePolling: true})
+
+	body := fetchViaSocks(t, socksAddr, upstream.URL+"/disabled")
+	if body != want {
+		t.Fatalf("body length = %d, want %d", len(body), len(want))
+	}
+}
+
 func TestSOCKSOverMachineResolver(t *testing.T) {
 	upstream := newHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "resolver:%s", r.URL.Path)
@@ -129,6 +184,15 @@ func newDNSServer(t *testing.T, allowHostPort string) *dnstunnel.Server {
 
 func startSocks(t *testing.T, rt session.RoundTripper) string {
 	t.Helper()
+	return startSocksWithOptions(t, rt, socksOptions{})
+}
+
+type socksOptions struct {
+	disablePolling bool
+}
+
+func startSocksWithOptions(t *testing.T, rt session.RoundTripper, opts socksOptions) string {
+	t.Helper()
 	c, err := session.NewClient(testSecret, rt, &metrics.Registry{})
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +201,7 @@ func startSocks(t *testing.T, rt session.RoundTripper) string {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() {
-		if err := (&socks.Server{Addr: addr, Client: c, Logger: log.Default()}).ListenAndServe(ctx); err != nil {
+		if err := (&socks.Server{Addr: addr, Client: c, Logger: log.Default(), DisablePolling: opts.disablePolling}).ListenAndServe(ctx); err != nil {
 			t.Errorf("socks server: %v", err)
 		}
 	}()
