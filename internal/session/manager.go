@@ -208,7 +208,7 @@ func (m *Manager) handleFrame(s *Session, f protocol.Frame) protocol.Frame {
 		if m.metrics != nil {
 			m.metrics.BytesRX.Add(int64(len(f.Payload)))
 		}
-		return st.response(f)
+		return st.responseAfterData(f, len(f.Payload) == protocol.MaxQueryPayload)
 	case protocol.TypePing:
 		st := m.getStream(s, f.StreamID)
 		if st == nil {
@@ -315,6 +315,16 @@ func (s *Stream) response(req protocol.Frame) protocol.Frame {
 		}
 		return closeFrame(req)
 	}
+}
+
+func (s *Stream) responseAfterData(req protocol.Frame, moreClientDataLikely bool) protocol.Frame {
+	if resp, ok := s.tryResponse(req); ok {
+		return resp
+	}
+	if moreClientDataLikely {
+		return protocol.Frame{Version: protocol.Version, Type: protocol.TypePong, StreamID: req.StreamID, Seq: req.Seq}
+	}
+	return s.response(req)
 }
 
 func (s *Stream) tryResponse(req protocol.Frame) (protocol.Frame, bool) {

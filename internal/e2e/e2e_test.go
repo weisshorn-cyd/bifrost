@@ -3,6 +3,7 @@ package e2e_test
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -104,6 +105,32 @@ func TestSOCKSOverDNSUDPLargeResponse(t *testing.T) {
 	got := fetchViaSocks(t, socksAddr, upstream.URL+"/large")
 	if got != body {
 		t.Fatalf("body length = %d, want %d", len(got), len(body))
+	}
+}
+
+func TestSOCKSOverDNSUDPHTTPSConnect(t *testing.T) {
+	upstream := newHTTPSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "https:%s", r.URL.Path)
+	}))
+	defer upstream.Close()
+
+	u, _ := url.Parse(upstream.URL)
+	dnsSrv := newDNSServer(t, u.Host)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dnsAddr := freeUDPAddr(t)
+	dnsSrv.Addr = dnsAddr
+	go func() {
+		if err := dnsSrv.ListenAndServe(ctx); err != nil {
+			t.Errorf("dns server: %v", err)
+		}
+	}()
+	waitUDP(t, dnsAddr)
+	socksAddr := startSocks(t, &dnstunnel.Client{Addr: dnsAddr, Domain: "t.example.com", Timeout: time.Second})
+
+	body := fetchHTTPSViaSocks(t, socksAddr, u.Host, "/secure")
+	if body != "https:/secure" {
+		t.Fatalf("body = %q, want https:/secure", body)
 	}
 }
 
@@ -267,6 +294,75 @@ func fetchViaSocks(t *testing.T, socksAddr, rawURL string) string {
 	return strings.TrimSpace(string(body))
 }
 
+func fetchHTTPSViaSocks(t *testing.T, socksAddr, host, path string) string {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", socksAddr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	var method [2]byte
+	if _, err := io.ReadFull(conn, method[:]); err != nil {
+		t.Fatal(err)
+	}
+	if method != [2]byte{0x05, 0x00} {
+		t.Fatalf("method response = %v", method)
+	}
+	hostName, port, err := net.SplitHostPort(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	portNum, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(hostName))}
+	req = append(req, []byte(hostName)...)
+	req = append(req, byte(portNum>>8), byte(portNum))
+	if _, err := conn.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	var reply [10]byte
+	if _, err := io.ReadFull(conn, reply[:]); err != nil {
+		t.Fatal(err)
+	}
+	if reply[1] != 0 {
+		t.Fatalf("socks connect reply = %d", reply[1])
+	}
+	tlsConn := tls.Client(conn, &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         hostName,
+		NextProtos:         largeALPNProtocols(),
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(tlsConn, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host)
+	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(body))
+}
+
+func largeALPNProtocols() []string {
+	protos := make([]string, 0, 81)
+	protos = append(protos, "http/1.1")
+	for i := 0; i < 80; i++ {
+		protos = append(protos, fmt.Sprintf("bifrost-e2e-proto-%02d", i))
+	}
+	return protos
+}
+
 func newHTTPServer(t *testing.T, h http.Handler) *httptest.Server {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -276,6 +372,18 @@ func newHTTPServer(t *testing.T, h http.Handler) *httptest.Server {
 	srv := httptest.NewUnstartedServer(h)
 	srv.Listener = ln
 	srv.Start()
+	return srv
+}
+
+func newHTTPSServer(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewUnstartedServer(h)
+	srv.Listener = ln
+	srv.StartTLS()
 	return srv
 }
 

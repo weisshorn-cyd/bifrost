@@ -7,7 +7,7 @@ PODMAN ?= podman
 GOFLAGS ?= -buildvcs=false -trimpath
 LDFLAGS ?= -s -w
 
-.PHONY: all fmt test build client server image clean
+.PHONY: all fmt test e2e build client server image clean
 
 all: fmt test build
 
@@ -16,6 +16,9 @@ fmt:
 
 test:
 	GOCACHE=$(GOCACHE) $(GO) test ./...
+
+e2e: build
+	./e2e/run.sh
 
 build: client server
 

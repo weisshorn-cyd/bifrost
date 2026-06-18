@@ -41,3 +41,14 @@ curl --socks5-hostname 127.0.0.1:1080 http://127.0.0.1:8080/
 ```
 
 The server defaults to deny-all egress. Use `-allow` or `BIFROST_ALLOW` to permit destinations.
+
+Run the black-box end-to-end suite (requires `curl` and public network access):
+
+```sh
+make e2e
+```
+
+It downloads `https://www.google.com/robots.txt` directly and through both the DNS and
+DoH SOCKS tunnels, compares the bodies byte-for-byte, and repeats the tunneled request
+concurrently. Override the defaults with `E2E_URL`, `E2E_ALLOW`, `E2E_CONCURRENCY`, or
+the `E2E_*_PORT` environment variables documented in `e2e/run.sh`.
